@@ -109,6 +109,6 @@ def main(zipcode, api_key):
 
 
 if __name__ == "__main__":
-    GOOGLE_MAPS_API_KEY = "AIzaSyDTs8wL1Fmf4iDqfIwqDODsZEHL1bfTkkk"
+    GOOGLE_MAPS_API_KEY = "YOUR_KEY"
     zipcode = "600032"
     main(zipcode, GOOGLE_MAPS_API_KEY)
