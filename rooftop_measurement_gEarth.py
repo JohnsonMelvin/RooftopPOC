@@ -1,9 +1,20 @@
+import ee
 import cv2
 import numpy as np
-from shapely.geometry import Polygon
 import requests
+from shapely.geometry import Polygon
+from math import radians, pi, cos
+from google.oauth2 import service_account
 from io import BytesIO
-from math import radians, log, tan, pi, atan2, sin, cos, exp, sqrt, atan
+
+SERVICE_ACCOUNT_KEY_FILE = "tandem-gmap-3ebb16bd8e55.json"
+SCOPES = ["https://www.googleapis.com/auth/earthengine"]
+
+credentials = service_account.Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_KEY_FILE, scopes=SCOPES
+)
+
+ee.Initialize(credentials)
 
 
 def get_coordinates(zipcode, api_key):
@@ -20,25 +31,67 @@ def get_coordinates(zipcode, api_key):
         raise Exception("Failed to fetch coordinates")
 
 
-def fetch_satellite_image(lat, lon, zoom, size, api_key):
-    url = f"https://maps.googleapis.com/maps/api/staticmap?center={lat},{lon}&zoom={zoom}&size={size}x{size}&maptype=satellite&key={api_key}"
-    response = requests.get(url)
+def fetch_satellite_image(lat, lon, zoom, size):
+    point = ee.Geometry.Point([lon, lat])
+    
+    image = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") \
+        .filterBounds(point) \
+        .filterDate('2022-01-01', '2023-01-01') \
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)) \
+        .sort('CLOUDY_PIXEL_PERCENTAGE', False) \
+        .first() \
+        .select(['B4', 'B3', 'B2'])
+
+    if image is None:
+        raise Exception("No suitable images found for the given criteria")
+
+    image_info = image.getInfo()
+    print("Image info:", image_info)
+    
+    params = {
+        "region": point.buffer(1000).bounds().getInfo()["coordinates"],
+        "dimensions": f"{size}x{size}",
+        "format": "png",
+    }
+    image_url = image.getThumbURL(params)
+
+    print("Region:", params['region'])
+    print("Image URL:", image_url)
+ 
+    response = requests.get(image_url)
     if response.status_code == 200:
+        with open("raw_satellite_image.png", "wb") as f:
+            f.write(response.content)
         return BytesIO(response.content)
     else:
-        raise Exception("Failed to fetch image")
+        raise Exception(f"Failed to fetch image from GEE. Status code: {response.status_code}")
 
 
 def process_image(image_stream):
     image = cv2.imdecode(
         np.frombuffer(image_stream.getvalue(), np.uint8), cv2.IMREAD_COLOR
     )
+    cv2.imwrite("debug_1_original.png", image)
+
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    cv2.imwrite("debug_2_gray.png", gray)
+
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
+    cv2.imwrite("debug_3_blurred.png", blurred)
+
+    edges = cv2.Canny(blurred, 10, 50) 
+    cv2.imwrite("debug_4_edges.png", edges)
+
     dilated = cv2.dilate(edges, None, iterations=2)
+    cv2.imwrite("debug_5_dilated.png", dilated)
+
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return contours, image.shape[0]
+
+    blank = np.zeros(image.shape, dtype=np.uint8)
+    cv2.drawContours(blank, contours, -1, (0, 255, 0), 2)
+    cv2.imwrite("debug_6_all_contours.png", blank)
+
+    return contours, image.shape[0], image
 
 
 def pixel_to_geo(pixel_x, pixel_y, center_lat, center_lon, zoom, img_size):
@@ -48,8 +101,8 @@ def pixel_to_geo(pixel_x, pixel_y, center_lat, center_lon, zoom, img_size):
 
 def pixel_to_world(pixel_x, pixel_y, zoom, img_size):
     scale = 256 * 2**zoom / img_size
-    x = (pixel_x - img_size / 2) / scale
-    y = (img_size / 2 - pixel_y) / scale
+    x = (pixel_x - img_size / 2) * scale
+    y = (img_size / 2 - pixel_y) * scale
     return x, y
 
 
@@ -62,9 +115,10 @@ def world_to_geo(world_coord, center_lat, center_lon):
 
 def measure_area_in_sqft(contours, center_lat, center_lon, zoom, img_size):
     buildings = []
-    MIN_ROOFTOP_AREA = 100
+    MIN_ROOFTOP_AREA = 50
 
-    for contour in contours:
+    print(f"Total contours found: {len(contours)}")
+    for i, contour in enumerate(contours):
         if len(contour) < 4:
             continue
 
@@ -79,6 +133,8 @@ def measure_area_in_sqft(contours, center_lat, center_lon, zoom, img_size):
         area_in_sqm = polygon.area * (111319.9 * cos(radians(center_lat))) ** 2
         area_in_sqft = area_in_sqm * 10.764
 
+        print(f"Contour {i}: Area = {area_in_sqft:.2f} sq. feet")
+
         if area_in_sqft >= MIN_ROOFTOP_AREA:
             centroid = polygon.centroid
             buildings.append(
@@ -90,10 +146,13 @@ def measure_area_in_sqft(contours, center_lat, center_lon, zoom, img_size):
 
 def main(zipcode, api_key):
     lat, lon = get_coordinates(zipcode, api_key)
-    zoom = 0 
+    zoom = 0
     img_size = 640
-    image_stream = fetch_satellite_image(lat, lon, zoom, img_size, api_key)
-    contours, img_size = process_image(image_stream)
+    image_stream = fetch_satellite_image(lat, lon, zoom, img_size)
+    contours, img_size, image = process_image(image_stream)
+
+    print(f"Number of contours detected: {len(contours)}")
+
     buildings = measure_area_in_sqft(contours, lat, lon, zoom, img_size)
 
     print(f"Zipcode: {zipcode}")
@@ -107,8 +166,13 @@ def main(zipcode, api_key):
         print(f"  Rooftop Area: {building['area_sqft']:.2f} sq. feet")
         print()
 
+    for contour in contours:
+        cv2.drawContours(image, [contour], 0, (0, 255, 0), 2)
+    cv2.imwrite(f"processed_image_{zipcode}.png", image)
+    print(f"Processed image saved as processed_image_{zipcode}.png")
+
 
 if __name__ == "__main__":
     GOOGLE_MAPS_API_KEY = "YOUR_KEY"
-    zipcode = "600032"
+    zipcode = "11755"
     main(zipcode, GOOGLE_MAPS_API_KEY)
